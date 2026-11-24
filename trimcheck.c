@@ -26,15 +26,27 @@
 
 #define DATAFILENAME   L"trimcheck.bin"
 #define SAVEFILENAME   L"trimcheck-cont.json"
-
 #define MB            (1024 * 1024)
 #define PADDINGSIZE_MB 32
+#define WENFORCE(expr, msg)  do { if (!(expr)) dieLastError(msg); } while (0)
+#define ENFORCE(expr, msg)   do { if (!(expr)) die(msg); } while (0)
+#define COLOR_RED    (FOREGROUND_RED   | FOREGROUND_INTENSITY)
+#define COLOR_GREEN  (FOREGROUND_GREEN | FOREGROUND_INTENSITY)
+
+typedef enum {
+  TRB_UNKNOWN = 0,  /* could not determine */
+  TRB_NONDET  = 1,  /* non-determinate read after TRIM */
+  TRB_DRAT    = 2,  /* deterministic after TRIM, but not zeros */
+  TRB_RZAT    = 3,  /* reads after TRIM return zeros */
+  TRB_FFAT    = 4   /* reads after TRIM return 0xFF (NVMe) */
+} TrimReadBehavior;
 
 typedef struct SaveData {
   wchar_t *ntDrivePath;
   ULONGLONG        offset;
   BYTE *rndBuffer;
   size_t           rndSize;
+  TrimReadBehavior behavior;
 } SaveData;
 
 static jmp_buf g_exitJmp;
@@ -77,10 +89,67 @@ static void diefmt(const wchar_t *fmt, ...) {
   die(buf);
 }
 
-#define WENFORCE(expr, msg)  do { if (!(expr)) dieLastError(msg); } while (0)
-#define ENFORCE(expr, msg)   do { if (!(expr)) die(msg); } while (0)
-
 /* ---------- вспомогательные функции ---------- */
+
+static void wprintColor(WORD attr, const wchar_t *s) {
+  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  WORD old = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+  if (GetConsoleScreenBufferInfo(h, &info))
+    old = info.wAttributes;
+  SetConsoleTextAttribute(h, attr);
+  wprintf(L"%s", s);
+  SetConsoleTextAttribute(h, old);
+}
+
+static int getBitLockerStatus(wchar_t driveLetter, DWORD *outStatus) {
+  static PROPERTYKEY fallbackKey = { {0x2D15A9A1, 0xA556, 0x4189,{0x91, 0xAD, 0x02, 0x74, 0x58, 0xF1, 0x1A, 0x07}}, 1717 };
+  wchar_t parsingName[3];
+  IShellItem2 *pDrive = NULL;
+  PROPERTYKEY pKey;
+  PROPVARIANT prop;
+  HRESULT hr;
+
+  parsingName[0] = driveLetter;
+  parsingName[1] = L':';
+  parsingName[2] = L'\0';
+
+  hr = SHCreateItemFromParsingName(parsingName, NULL, &IID_IShellItem2, (void **)&pDrive);
+  if (FAILED(hr)) return -1;
+
+  hr = PSGetPropertyKeyFromName(L"System.Volume.BitLockerProtection", &pKey);
+  if (FAILED(hr)) pKey = fallbackKey;
+
+  PropVariantInit(&prop);
+  hr = pDrive->lpVtbl->GetProperty(pDrive, &pKey, &prop);
+  pDrive->lpVtbl->Release(pDrive);
+  if (FAILED(hr)) return -1;
+
+  switch (prop.vt) {
+    case VT_UI4: case VT_I4: *outStatus = prop.ulVal; break;
+    case VT_UI8:             *outStatus = (DWORD)prop.uhVal.QuadPart; break;
+    default:
+      PropVariantClear(&prop);
+      return -1;
+  }
+  PropVariantClear(&prop);
+  return 0;
+}
+
+static int isElevated(void) {
+  HANDLE hToken = NULL;
+  TOKEN_ELEVATION elev;
+  DWORD cb = sizeof(elev);
+
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+    return 0;
+  if (!GetTokenInformation(hToken, TokenElevation, &elev, sizeof(elev), &cb)) {
+    CloseHandle(hToken);
+    return 0;
+  }
+  CloseHandle(hToken);
+  return elev.TokenIsElevated != 0;
+}
 
 static wchar_t *wnew(size_t nWchars) {
   wchar_t *p = (wchar_t *)malloc(nWchars * sizeof(wchar_t));
@@ -247,7 +316,7 @@ static void jsonWriteString(FILE *f, const wchar_t *s) {
 }
 
 static void saveJson(const wchar_t *path, const wchar_t *ntDrivePath,
-  ULONGLONG offset, const BYTE *rnd, size_t rndSize) {
+  ULONGLONG offset, const BYTE *rnd, size_t rndSize, TrimReadBehavior behavior) {
   FILE *f;
   size_t i;
 
@@ -258,7 +327,7 @@ static void saveJson(const wchar_t *path, const wchar_t *ntDrivePath,
   fprintf(f, "\",\"offset\":%I64u,\"rndBuffer\":\"", offset);
   for (i = 0; i < rndSize; i++)
     fprintf(f, "%02X", rnd[i]);
-  fputs("\"}\n", f);
+  fprintf(f, "\",\"behavior\":%d}\n", (int)behavior);
   fclose(f);
 }
 
@@ -429,7 +498,170 @@ static void loadSaveData(const wchar_t *path, SaveData *sd) {
     die(L"Corrupt continuation data file");
   p = expectKey(end, "rndBuffer");
   p = parseHexValue(p, &sd->rndBuffer, &sd->rndSize);
+  sd->behavior = TRB_UNKNOWN;
+  p = skipWs(p);
+  if (*p == ',') {
+    p = expectKey(p + 1, "behavior");
+    sd->behavior = (TrimReadBehavior)strtol(p, &end, 10);
+    if (end == p)
+      die(L"Corrupt continuation data file");
+  }
   free(text);
+}
+
+/* ---------- DRAT / RZAT / DLFEAT detection ----------
+ * Minimal local definitions of the STORAGE_PROTOCOL_QUERY_PROPERTY
+ * structures (documented for Windows 8+). Kept independent of the SDK
+ * version so this builds with MSVC 2010 / Windows SDK 7.0a. */
+
+#define TC_PROP_PROTOCOL_SPECIFIC  50  /* StorageDeviceProtocolSpecificProperty */
+#define TC_PROTO_ATA               2
+#define TC_PROTO_NVME              3
+#define TC_ATA_DATA_IDENTIFY       1
+#define TC_NVME_DATA_IDENTIFY      1
+
+#ifndef BusTypeNvme
+#define BusTypeNvme 17
+#endif
+
+typedef struct {
+  DWORD protocolType;
+  DWORD dataType;
+  DWORD requestValue;
+  DWORD requestSubValue;
+  DWORD dataOffset;
+  DWORD dataLength;
+  DWORD fixedReturn;
+  DWORD reserved[3];
+} TC_PROTO_DATA;
+
+typedef struct {
+  DWORD version;
+  DWORD size;
+  TC_PROTO_DATA protoData;
+} TC_PROTO_DESC;
+
+typedef struct {  /* mirrors STORAGE_PROPERTY_QUERY */
+  DWORD propertyId;
+  DWORD queryType;
+  TC_PROTO_DATA protoData;
+} TC_QUERY;
+
+static BOOL queryProtocolData(HANDLE hDevice, const TC_QUERY *query,
+  BYTE *outBuf, DWORD outSize, const BYTE **data) {
+  TC_PROTO_DESC *desc;
+  DWORD bytes = 0;
+
+  *data = NULL;
+  if (!DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY,
+      (void *)query, sizeof(*query), outBuf, outSize, &bytes, NULL))
+    return FALSE;
+  if (bytes < sizeof(TC_PROTO_DESC))
+    return FALSE;
+  desc = (TC_PROTO_DESC *)outBuf;
+  if (desc->version != 1 || bytes < (DWORD)sizeof(TC_PROTO_DESC) + query->protoData.dataLength)
+    return FALSE;
+  /* dataOffset is relative to the start of TC_PROTO_DATA */
+  *data = (const BYTE *)&desc->protoData + desc->protoData.dataOffset;
+  return TRUE;
+}
+
+static DWORD getBusType(HANDLE hDevice) {
+  STORAGE_PROPERTY_QUERY q;
+  BYTE out[512];
+  STORAGE_DEVICE_DESCRIPTOR *d;
+  DWORD bytes = 0;
+
+  q.PropertyId = StorageDeviceProperty;
+  q.QueryType = PropertyStandardQuery;
+  if (!DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q),
+      out, sizeof(out), &bytes, NULL))
+    return 0;
+  if (bytes < sizeof(STORAGE_DEVICE_DESCRIPTOR))
+    return 0;
+  d = (STORAGE_DEVICE_DESCRIPTOR *)out;
+  return d->BusType;
+}
+
+static TrimReadBehavior queryAtaBehavior(HANDLE hDevice) {
+  BYTE outBuf[1024];
+  TC_QUERY query;
+  const BYTE *data;
+  const WORD *id;
+
+  ZeroMemory(&query, sizeof(query));
+  query.propertyId = TC_PROP_PROTOCOL_SPECIFIC;
+  query.protoData.protocolType = TC_PROTO_ATA;
+  query.protoData.dataType = TC_ATA_DATA_IDENTIFY;
+  query.protoData.dataOffset = sizeof(TC_PROTO_DATA);
+  query.protoData.dataLength = 512;
+  if (!queryProtocolData(hDevice, &query, outBuf, sizeof(outBuf), &data))
+    return TRB_UNKNOWN;
+  id = (const WORD *)data;
+  if (!(id[169] & 0x0001))  /* word 169, bit 0: DATA SET MANAGEMENT (TRIM) */
+    return TRB_UNKNOWN;
+  if (id[69] & 0x4000)      /* word 69, bit 14: DRAT */
+    return (id[69] & 0x0020) ? TRB_RZAT : TRB_DRAT;  /* word 69, bit 5: RZAT */
+  return TRB_NONDET;
+}
+
+static TrimReadBehavior queryNvmeBehavior(HANDLE hDevice) {
+  BYTE outBuf[8192];
+  TC_QUERY query;
+  const BYTE *data;
+  DWORD candidates[3];
+  int i;
+
+  /* NSID candidates: broadcast, then 0 and 1 - stornvme resolves the
+   * namespace of the device handle for these in practice */
+  candidates[0] = 0xFFFFFFFF;
+  candidates[1] = 0;
+  candidates[2] = 1;
+  for (i = 0; i < 3; i++) {
+    ZeroMemory(&query, sizeof(query));
+    query.propertyId = TC_PROP_PROTOCOL_SPECIFIC;
+    query.protoData.protocolType = TC_PROTO_NVME;
+    query.protoData.dataType = TC_NVME_DATA_IDENTIFY;
+    query.protoData.requestValue = 1;              /* CNS = 1: Identify Namespace */
+    query.protoData.requestSubValue = candidates[i];
+    query.protoData.dataOffset = sizeof(TC_PROTO_DATA);
+    query.protoData.dataLength = 4096;
+    if (!queryProtocolData(hDevice, &query, outBuf, sizeof(outBuf), &data))
+      continue;
+    switch (data[33] & 0x07) {  /* DLFEAT (byte 33), bits 2:0 */
+      case 0x01: return TRB_RZAT;
+      case 0x02: return TRB_FFAT;
+      case 0x00: return TRB_NONDET;
+      default:   return TRB_DRAT;
+    }
+  }
+  return TRB_UNKNOWN;
+}
+
+static TrimReadBehavior queryTrimReadBehavior(HANDLE hDevice) {
+  DWORD bus;
+  TrimReadBehavior b;
+
+  bus = getBusType(hDevice);
+  if (bus == BusTypeNvme)
+    return queryNvmeBehavior(hDevice);
+  if (bus == BusTypeAta || bus == BusTypeSata)
+    return queryAtaBehavior(hDevice);
+  /* Unknown bus (USB bridge etc.) - try both protocols */
+  b = queryAtaBehavior(hDevice);
+  if (b == TRB_UNKNOWN)
+    b = queryNvmeBehavior(hDevice);
+  return b;
+}
+
+static const wchar_t *behaviorName(TrimReadBehavior b) {
+  switch (b) {
+    case TRB_NONDET: return L"non-determinate read after TRIM";
+    case TRB_DRAT:   return L"DRAT (deterministic, not zeroed)";
+    case TRB_RZAT:   return L"RZAT (zeros after TRIM)";
+    case TRB_FFAT:   return L"0xFF after TRIM (NVMe)";
+    default:         return L"unknown";
+  }
 }
 
 /* ---------- create ---------- */
@@ -450,6 +682,8 @@ static void create(void) {
   BY_HANDLE_FILE_INFORMATION fileInformation;
   LONGLONG dataStartVCN, dataEndVCN;
   ULONGLONG offset;
+  TrimReadBehavior behavior;
+  HANDLE hProbe;
   int n, k;
 
   wprintf(L"USAGE: Place this program file on the same drive\n");
@@ -607,7 +841,19 @@ static void create(void) {
   g_hTestFileOpen = 0;
 
   wprintf(L"Saving continuation data to %s...\n", SAVEFILENAME);
-  saveJson(SAVEFILENAME, ntDrivePath, offset, rndBuffer, dataSize);
+  wprintf(L"Querying drive TRIM read behavior (DRAT/RZAT/DLFEAT)...\n");
+  behavior = TRB_UNKNOWN;
+  hProbe = CreateFileW(ntDrivePath, GENERIC_READ,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+  if (hProbe != INVALID_HANDLE_VALUE) {
+    behavior = queryTrimReadBehavior(hProbe);
+    CloseHandle(hProbe);
+  } else {
+    wprintf(L"  (could not open drive for capability query, skipping)\n");
+  }
+  wprintf(L"  Drive reports: %s\n", behaviorName(behavior));
+
+  saveJson(SAVEFILENAME, ntDrivePath, offset, rndBuffer, dataSize, behavior);
 
   flushDiskBuffers(ntDrivePath);
 
@@ -651,23 +897,41 @@ static void verify(void) {
   readBuffer = readBufferFromDisk(sd.ntDrivePath, sd.offset, dataSize);
   g_failureHint[0] = 0;
 
-  if (memcmp(readBuffer, sd.rndBuffer, dataSize) == 0) {
+  if (allBytesEq(readBuffer, dataSize, 0x00) ||
+      allBytesEq(readBuffer, dataSize, 0xFF)) {
+    wprintf(L"Data is empty (filled with 0x%02X bytes).\n\n", readBuffer[0]);
+    wprintColor(COLOR_GREEN, L"CONCLUSION: TRIM appears to be WORKING!\n");
+    DeleteFileW(SAVEFILENAME);
+  } else if (memcmp(readBuffer, sd.rndBuffer, dataSize) == 0) {
     wprintf(L"Data unchanged.\n\n");
-    wprintf(L"CONCLUSION: TRIM appears to be NOT WORKING (or has not kicked in yet).\n\n");
-    wprintf(L"Note: This may also indicate that the drive does not support DZAT\n");
-    wprintf(L"(Deterministic Zero After Trim), even when TRIM is working.\n\n");
+    if (sd.behavior == TRB_RZAT || sd.behavior == TRB_FFAT) {
+      wprintColor(COLOR_RED, L"CONCLUSION: TRIM appears to be NOT WORKING.\n\n");
+      wprintf(L"This drive reports that reads after TRIM return zeros/0xFF,\n");
+      wprintf(L"yet our data came back intact. If you just ran the test,\n");
+      wprintf(L"wait around 20 seconds and re-run; also check that TRIM is\n");
+      wprintf(L"enabled (fsutil behavior query DisableDeleteNotify) and that\n");
+      wprintf(L"the drive is not behind a USB bridge that does not pass TRIM.\n\n");
+    } else if (sd.behavior == TRB_DRAT) {
+      wprintColor(COLOR_RED, L"CONCLUSION: INDETERMINATE for this drive model.\n\n");
+      wprintf(L"This drive reports DRAT (deterministic read after TRIM)\n");
+      wprintf(L"but NOT RZAT (zeros after TRIM). Such drives may legitimately\n");
+      wprintf(L"return the old data after TRIM, so trimcheck cannot\n");
+      wprintf(L"distinguish this case from \"TRIM not working\".\n");
+      wprintf(L"For a definitive answer, test this drive from Linux\n");
+      wprintf(L"(blkdiscard on a temporary file, then read it back),\n");
+      wprintf(L"or use a kernel-level TRIM monitor.\n\n");
+    } else {
+      wprintColor(COLOR_RED, L"CONCLUSION: TRIM appears to be NOT WORKING\n(or has not kicked in yet).\n\n");
+      if (sd.behavior == TRB_UNKNOWN)
+        wprintf(L"Note: the drive's read-after-TRIM behavior could not be\nqueried (common behind USB bridges, or on Windows older than\nWindows 8), so the classic caveat applies: a drive without\nRZAT support may return the old data even when TRIM works.\n\n");
+    }
     wprintf(L"You can re-run this program to test again with the same data block,\n");
     wprintf(L"or delete %s to create a new test file.\n", SAVEFILENAME);
-  } else if (allBytesEq(readBuffer, dataSize, 0x00) ||
-    allBytesEq(readBuffer, dataSize, 0xFF)) {
-    wprintf(L"Data is empty (filled with 0x%02X bytes).\n\n", readBuffer[0]);
-    wprintf(L"CONCLUSION: TRIM appears to be WORKING!\n");
-    DeleteFileW(SAVEFILENAME);
   } else {
     wprintf(L"Data is neither unchanged nor empty.\n");
     wprintf(L"Possible cause: another program saved data to disk,\n");
     wprintf(L"overwriting the sector containing our test data.\n\n");
-    wprintf(L"CONCLUSION: INDETERMINATE.\n");
+    wprintColor(COLOR_RED,L"CONCLUSION: INDETERMINATE.\n");
     wprintf(L"Re-run this program and wait less before verifying / try to\nminimize writes to drive %s.\n", sd.ntDrivePath + wcslen(sd.ntDrivePath) - 2);
     DeleteFileW(SAVEFILENAME);
   }
@@ -675,57 +939,6 @@ static void verify(void) {
   free(readBuffer);
   free(sd.rndBuffer);
   free(sd.ntDrivePath);
-}
-
-/* Returns 0 on success and fills *outStatus, -1 on failure.
- * Fallback PKEY hardcoded in case PSGetPropertyKeyFromName is unavailable. */
-static int getBitLockerStatus(wchar_t driveLetter, DWORD *outStatus) {
-  static PROPERTYKEY fallbackKey = { {0x2D15A9A1, 0xA556, 0x4189,{0x91, 0xAD, 0x02, 0x74, 0x58, 0xF1, 0x1A, 0x07}}, 1717 };
-  wchar_t parsingName[3];
-  IShellItem2 *pDrive = NULL;
-  PROPERTYKEY pKey;
-  PROPVARIANT prop;
-  HRESULT hr;
-
-  parsingName[0] = driveLetter;
-  parsingName[1] = L':';
-  parsingName[2] = L'\0';
-
-  hr = SHCreateItemFromParsingName(parsingName, NULL, &IID_IShellItem2, (void **)&pDrive);
-  if (FAILED(hr)) return -1;
-
-  hr = PSGetPropertyKeyFromName(L"System.Volume.BitLockerProtection", &pKey);
-  if (FAILED(hr)) pKey = fallbackKey;
-
-  PropVariantInit(&prop);
-  hr = pDrive->lpVtbl->GetProperty(pDrive, &pKey, &prop);
-  pDrive->lpVtbl->Release(pDrive);
-  if (FAILED(hr)) return -1;
-
-  switch (prop.vt) {
-    case VT_UI4: case VT_I4: *outStatus = prop.ulVal; break;
-    case VT_UI8:             *outStatus = (DWORD)prop.uhVal.QuadPart; break;
-    default:
-      PropVariantClear(&prop);
-      return -1;
-  }
-  PropVariantClear(&prop);
-  return 0;
-}
-
-static int isElevated(void) {
-  HANDLE hToken = NULL;
-  TOKEN_ELEVATION elev;
-  DWORD cb = sizeof(elev);
-
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
-    return 0;
-  if (!GetTokenInformation(hToken, TokenElevation, &elev, sizeof(elev), &cb)) {
-    CloseHandle(hToken);
-    return 0;
-  }
-  CloseHandle(hToken);
-  return elev.TokenIsElevated != 0;
 }
 
 static void run(void) {
@@ -738,8 +951,8 @@ static void run(void) {
   wprintf(L"https://github.com/CyberShadow/trimcheck\n\n");
 
   if (!isElevated()) {
-    wprintf(L"Error: This program must be run as Administrator.\n");
-    wprintf(L"Right-click the executable and select \"Run as administrator\".\n\n");
+    wprintColor(COLOR_RED,L"Error: This program must be run as Administrator.\n");
+    wprintColor(COLOR_RED,L"Right-click the executable and select \"Run as administrator\".\n\n");
     return;
   }
 
